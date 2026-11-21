@@ -21,6 +21,15 @@ lighting.
 - Runs on DirectX 12 and Vulkan.
 - Built and tested on Unreal Engine 5.6.1, Windows, RTX 3060 Ti.
 
+## Ambient occlusion in action
+
+The same cube-on-floor scene with GHOSTAO disabled and enabled (UE 5.6, radius 150 cm):
+
+<p align="center">
+  <img src="Docs/ao_off.jpg" width="49%" alt="Without GHOSTAO">
+  <img src="Docs/ao_on.jpg" width="49%" alt="With GHOSTAO">
+</p>
+
 ---
 
 ## 1. Requirements
