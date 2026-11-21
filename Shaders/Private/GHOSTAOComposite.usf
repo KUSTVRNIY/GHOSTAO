@@ -45,19 +45,9 @@ void MainCompositeCS(uint3 ThreadId : SV_DispatchThreadID)
 
 		float aoApplied = lerp(1.0f, ao, saturate(GhostAOIntensity));
 
-		float specularOcclusion = 1.0f;
-		float bentLengthSqrd = dot(bentNormal, bentNormal);
-		if (bentLengthSqrd > 1e-4f)
-		{
-			float3 geometryNormal = ghostao_decodeNormal(packedData);
-			float3 viewPosition = ghostao_unproject(GhostAOUnprojectParams, texCoords, linearDepth);
-			float3 viewDirection = normalize(-viewPosition);
-			float3 reflectionDirection = reflect(-viewDirection, geometryNormal);
-			specularOcclusion = saturate(dot(bentNormal, reflectionDirection));
-			specularOcclusion *= specularOcclusion;
-		}
-
+		float specularOcclusion = sqrt(ao);
 		float specularApplied = lerp(1.0f, specularOcclusion, saturate(GhostAOSpecularOcclusion));
+
 		color *= aoApplied * specularApplied;
 	}
 

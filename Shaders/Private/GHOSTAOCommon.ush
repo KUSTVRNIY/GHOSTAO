@@ -14,7 +14,7 @@
 #endif
 
 #ifndef GHOSTAO_SAMPLE_COUNT
-#define GHOSTAO_SAMPLE_COUNT 8
+#define GHOSTAO_SAMPLE_COUNT 16
 #endif
 
 #define ghostao_bool bool

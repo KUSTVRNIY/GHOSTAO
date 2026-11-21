@@ -1,9 +1,12 @@
 // Powered by rly_ghost
 #include "/Engine/Private/Common.ush"
+#include "/Plugin/GHOSTAO/Private/GHOSTAOCommon.ush"
 
 int2 GhostAOResolution;
 float4x4 GhostAOPrevViewProj;
-float4x4 GhostAOInvViewProj;
+Texture2D<uint> GhostAOPackedData;
+float4 GhostAOUnprojectParams;
+float4x4 GhostAOViewToWorld;
 float GhostAOTemporalBlend;
 
 Texture2D<float> GhostAOAOIn;
@@ -43,20 +46,19 @@ void MainTemporalCS(uint3 ThreadId : SV_DispatchThreadID)
 	}
 
 	float2 uv = (float2(ThreadId.xy) + 0.5f) / float2(resolution);
-	float deviceZ = SceneTexturesStruct.SceneDepthTexture.Load(int3(int2(ThreadId.xy), 0)).r;
+	uint packedData = GhostAOPackedData.Load(int3(int2(ThreadId.xy), 0));
+	float linearDepth = ghostao_unpackDepth(packedData);
 	float currentAO = GhostAOAOIn.Load(int3(int2(ThreadId.xy), 0));
 
-	if (deviceZ == 0.0f)
+	if (linearDepth == 0.0f)
 	{
 		GhostAOAOOut[ThreadId.xy] = 1.0f;
 		GhostAOBentNormalOut[ThreadId.xy] = float4(0.0f, 0.0f, 0.0f, 0.0f);
 		return;
 	}
 
-	float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
-	float4 clip = float4(ndc, deviceZ, 1.0f);
-	float4 worldH = mul(clip, GhostAOInvViewProj);
-	float3 worldPosition = worldH.xyz / worldH.w;
+	float3 viewPosition = ghostao_unproject(GhostAOUnprojectParams, uv, linearDepth);
+	float3 worldPosition = mul(float4(viewPosition, 1.0f), GhostAOViewToWorld).xyz;
 
 	float4 prevClip = mul(float4(worldPosition, 1.0f), GhostAOPrevViewProj);
 	bool historyValid = false;
@@ -69,7 +71,7 @@ void MainTemporalCS(uint3 ThreadId : SV_DispatchThreadID)
 	}
 
 	float result = currentAO;
-	if (historyValid && GhostAOTemporalBlend < 1.0f)
+	if (GhostAOTemporalBlend < 1.0f)
 	{
 		float localMin = 1e9f;
 		float localMax = -1e9f;
@@ -86,16 +88,18 @@ void MainTemporalCS(uint3 ThreadId : SV_DispatchThreadID)
 			}
 		}
 
-		float historyAO = ghostao_loadAOBilinear(GhostAOAOHistory, prevUV);
+		float2 historyUV = historyValid ? prevUV : uv;
+		float historyAO = ghostao_loadAOBilinear(GhostAOAOHistory, historyUV);
 		historyAO = clamp(historyAO, localMin, localMax);
 		result = lerp(historyAO, currentAO, saturate(GhostAOTemporalBlend));
 	}
 
 	float4 currentBentNormal = GhostAOBentNormalIn.Load(int3(int2(ThreadId.xy), 0));
 	float3 bentNormalResult = currentBentNormal.xyz;
-	if (historyValid && GhostAOTemporalBlend < 1.0f && dot(currentBentNormal.xyz, currentBentNormal.xyz) > 1e-8f)
+	if (GhostAOTemporalBlend < 1.0f && dot(currentBentNormal.xyz, currentBentNormal.xyz) > 1e-8f)
 	{
-		int2 prevPixel = clamp(int2(floor(prevUV * float2(resolution))), int2(0, 0), resolution - 1);
+		float2 historyUV = historyValid ? prevUV : uv;
+		int2 prevPixel = clamp(int2(floor(historyUV * float2(resolution))), int2(0, 0), resolution - 1);
 		float3 historyBentNormal = GhostAOBentNormalHistory.Load(int3(prevPixel, 0)).xyz;
 		float3 blended = lerp(historyBentNormal, currentBentNormal.xyz, saturate(GhostAOTemporalBlend));
 		float blendedLengthSqrd = dot(blended, blended);

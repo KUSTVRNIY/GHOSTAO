@@ -8,6 +8,7 @@
 #include "RenderGraphUtils.h"
 #include "SceneRenderTargetParameters.h"
 #include "SceneTexturesConfig.h"
+#include "SceneView.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "CoreGlobals.h"
 #include "HAL/IConsoleManager.h"
@@ -116,7 +117,7 @@ public:
 	SHADER_USE_PARAMETER_STRUCT(FGHOSTAOTemporalCS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FSceneTextureUniformParameters, GhostAOSceneTextures)
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint>, GhostAOPackedData)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float>, GhostAOAOIn)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float>, GhostAOAOHistory)
 		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, GhostAOBentNormalIn)
@@ -125,7 +126,8 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, GhostAOBentNormalOut)
 		SHADER_PARAMETER(FIntPoint, GhostAOResolution)
 		SHADER_PARAMETER(FMatrix44f, GhostAOPrevViewProj)
-		SHADER_PARAMETER(FMatrix44f, GhostAOInvViewProj)
+		SHADER_PARAMETER(FMatrix44f, GhostAOViewToWorld)
+		SHADER_PARAMETER(FVector4f, GhostAOUnprojectParams)
 		SHADER_PARAMETER(float, GhostAOTemporalBlend)
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -492,7 +494,11 @@ namespace GHOSTAO
 		FRDGTextureRef BentNormalAccumTexture = GraphBuilder.CreateTexture(BentNormalAccumDesc, TEXT("GHOSTAO.BentNormalAccumulated"));
 
 		float TemporalBlend = FMath::Clamp(CVarGHOSTAOTemporalBlend.GetValueOnRenderThread(), 0.01f, 1.0f);
-		const void* ViewKey = (const void*)View.State;
+		uint64 ViewKeyBits = (View.Family != nullptr && View.Family->Scene != nullptr)
+			? (uint64)(UPTRINT)View.Family->Scene
+			: 0ull;
+		ViewKeyBits ^= ((uint64)(uint32)Extent.X << 32) | (uint64)(uint32)Extent.Y;
+		const void* ViewKey = (const void*)ViewKeyBits;
 		FHistoryEntry* HistoryEntry = ViewKey != nullptr ? GGHOSTAOHistory.Find(ViewKey) : nullptr;
 		const bool bHistoryValid = HistoryEntry != nullptr
 			&& HistoryEntry->bHasHistory
@@ -515,11 +521,20 @@ namespace GHOSTAO
 		{
 			TemporalBlend = 1.0f;
 		}
+		else
+		{
+			static bool GGHOSTAOLoggedHistoryActive = false;
+			if (!GGHOSTAOLoggedHistoryActive)
+			{
+				GGHOSTAOLoggedHistoryActive = true;
+				UE_LOG(LogTemp, Log, TEXT("[GHOSTAO] Temporal history active."));
+			}
+		}
 
 		{
 			TShaderMapRef<FGHOSTAOTemporalCS> Shader(GetGlobalShaderMap(View.GetFeatureLevel()));
 			FGHOSTAOTemporalCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FGHOSTAOTemporalCS::FParameters>();
-			PassParameters->GhostAOSceneTextures = SceneTextureUniformBuffer;
+			PassParameters->GhostAOPackedData = GraphBuilder.CreateSRV(PackedTexture);
 			PassParameters->GhostAOAOIn = GraphBuilder.CreateSRV(AOFilteredTexture);
 			PassParameters->GhostAOAOHistory = GraphBuilder.CreateSRV(HistoryTexture);
 			PassParameters->GhostAOBentNormalIn = GraphBuilder.CreateSRV(BentNormalTexture);
@@ -528,7 +543,8 @@ namespace GHOSTAO
 			PassParameters->GhostAOBentNormalOut = GraphBuilder.CreateUAV(BentNormalAccumTexture);
 			PassParameters->GhostAOResolution = Extent;
 			PassParameters->GhostAOPrevViewProj = PrevViewProj;
-			PassParameters->GhostAOInvViewProj = ToMatrix44f(View.ViewMatrices.GetInvViewProjectionMatrix());
+			PassParameters->GhostAOViewToWorld = ToMatrix44f(View.ViewMatrices.GetInvViewMatrix());
+			PassParameters->GhostAOUnprojectParams = FVector4f(2.0f * TanHalfFovX, -2.0f * TanHalfFovY, -TanHalfFovX, TanHalfFovY);
 			PassParameters->GhostAOTemporalBlend = TemporalBlend;
 
 			FComputeShaderUtils::AddPass(
