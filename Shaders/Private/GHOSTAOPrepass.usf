@@ -1,0 +1,72 @@
+// Powered by rly_ghost
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/GHOSTAO/Private/GHOSTAOCommon.ush"
+
+int2 GhostAOPackedResolution;
+float GhostAODepthScale;
+float GhostAODepthOffset;
+uint GhostAORandomSeed;
+float4x4 GhostAOClipToView;
+
+RWTexture2D<uint> GhostAOPackedOut;
+
+float3 ghostao_viewPosRH(int2 px, int2 res)
+{
+	float2 uv = (float2(px) + 0.5f) / float2(res);
+	float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+	float d = SceneTexturesStruct.SceneDepthTexture.Load(int3(px, 0)).r;
+	float4 clip = float4(ndc, d, 1.0f);
+	float4 vp = mul(clip, GhostAOClipToView);
+	vp /= vp.w;
+	return float3(vp.x, vp.y, -vp.z);
+}
+
+float3 ghostao_reconstructNormal(int2 px, int2 res)
+{
+	int2 maxPx = res - 1;
+	int2 pxR = clamp(px + int2(1, 0), int2(0, 0), maxPx);
+	int2 pxD = clamp(px + int2(0, 1), int2(0, 0), maxPx);
+
+	float3 p0 = ghostao_viewPosRH(px, res);
+	float3 p1 = ghostao_viewPosRH(pxR, res);
+	float3 p2 = ghostao_viewPosRH(pxD, res);
+
+	float3 n = cross(p1 - p0, p2 - p0);
+	float len = length(n);
+	n = (len > 1e-8f) ? (n / len) : float3(0.0f, 0.0f, 1.0f);
+	float3 toCam = -normalize(p0);
+	if (dot(n, toCam) < 0.0f)
+	{
+		n = -n;
+	}
+	return n;
+}
+
+[numthreads(8, 8, 1)]
+void MainPrepassCS(uint3 Tid : SV_DispatchThreadID)
+{
+	int2 res = GhostAOPackedResolution;
+	if (any(Tid.xy >= uint2(res)))
+	{
+		return;
+	}
+
+	float depth = SceneTexturesStruct.SceneDepthTexture.Load(int3(Tid.xy, 0)).r;
+	uint packedData = 0u;
+
+	float skyBoxDepth = float(GhostAODepthScale < 0.0f);
+	if (depth != skyBoxDepth)
+	{
+		float linearDepth = 1.0f / mad(depth, GhostAODepthScale, GhostAODepthOffset);
+		float3 normal = ghostao_reconstructNormal(int2(Tid.xy), res);
+
+		uint seed = ghostao_hash(ghostao_seed(uint2(Tid.xy)) + GhostAORandomSeed);
+		float2 dither = float2(ghostao_unpack16(seed)) * (1.0f / 65535.0f);
+
+		uint mask = (1u << GHOSTAO_PACKED_NORMAL_BITS) - 1u;
+		uint packedNormal = ghostao_encodeNormal(normal, dither);
+		packedData = (asuint(linearDepth) & ~mask) | (packedNormal & mask);
+	}
+
+	GhostAOPackedOut[Tid.xy] = packedData;
+}

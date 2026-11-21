@@ -1,0 +1,99 @@
+// Powered by rly_ghost
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/GHOSTAO/Private/GHOSTAOCommon.ush"
+
+#define GHOSTAO_LUT_DIRECTION_RESOLUTION 24
+#define GHOSTAO_LUT_RADIUS_RESOLUTION 16
+#define GHOSTAO_LUT_MAX_OCCLUDER_RADIUS 1.41421356237309504880f
+
+RWTexture3D<uint> GhostAOLutOut;
+
+[numthreads(4, 4, 4)]
+void MainLutCoverageCS(uint3 Tid : SV_DispatchThreadID)
+{
+	if (Tid.x >= uint(GHOSTAO_LUT_DIRECTION_RESOLUTION) ||
+		Tid.y >= uint(GHOSTAO_LUT_DIRECTION_RESOLUTION) ||
+		Tid.z >= uint(GHOSTAO_LUT_RADIUS_RESOLUTION))
+	{
+		return;
+	}
+
+	float2 sphereMapCoords = (float2(Tid.xy) + 0.5f) / float(GHOSTAO_LUT_DIRECTION_RESOLUTION);
+	float3 occluderDirection = ghostao_decodeSphereMap(sphereMapCoords);
+
+	float occluderRadius = GHOSTAO_LUT_MAX_OCCLUDER_RADIUS * (float(Tid.z) + 0.5f) / float(GHOSTAO_LUT_RADIUS_RESOLUTION);
+	float occluderCosAngle = 1.0f - occluderRadius * occluderRadius * 0.5f;
+
+	uint rayBits = 0u;
+	if (occluderDirection.z != -1.0f)
+	{
+		ghostao_unroll
+		for (uint j = 0u; j < uint(GHOSTAO_RAY_COUNT); j++)
+		{
+			if (dot(occluderDirection, ghostao_rayDirection(j)) > occluderCosAngle)
+			{
+				rayBits |= 1u << j;
+			}
+		}
+	}
+
+	GhostAOLutOut[Tid] = rayBits;
+}
+
+[numthreads(16, 16, 1)]
+void MainLutFillCS(uint3 Tid : SV_DispatchThreadID)
+{
+	uint index = Tid.x + Tid.y * 16u;
+	uint rayIndex = index % uint(GHOSTAO_RAY_COUNT);
+	uint radiusIndex = index / uint(GHOSTAO_RAY_COUNT);
+
+	if (radiusIndex >= uint(GHOSTAO_LUT_RADIUS_RESOLUTION))
+	{
+		return;
+	}
+
+	float3 rayDirection = ghostao_rayDirection(rayIndex);
+
+	uint bestX = 0u;
+	uint bestY = 0u;
+	float bestDot = -2.0f;
+
+	for (uint y = 0u; y < uint(GHOSTAO_LUT_DIRECTION_RESOLUTION); y++)
+	{
+		for (uint x = 0u; x < uint(GHOSTAO_LUT_DIRECTION_RESOLUTION); x++)
+		{
+			float2 sphereMapCoords = (float2(x, y) + 0.5f) / float(GHOSTAO_LUT_DIRECTION_RESOLUTION);
+			float dotValue = dot(ghostao_decodeSphereMap(sphereMapCoords), rayDirection);
+			if (dotValue > bestDot)
+			{
+				bestDot = dotValue;
+				bestX = x;
+				bestY = y;
+			}
+		}
+	}
+
+	InterlockedOr(GhostAOLutOut[uint3(bestX, bestY, radiusIndex)], 1u << rayIndex);
+}
+
+RWTexture2D<float4> GhostAOBentNormalLutOut;
+
+[numthreads(16, 16, 1)]
+void MainBentNormalLutCS(uint3 Tid : SV_DispatchThreadID)
+{
+	uint mask = Tid.y * 256u + Tid.x;
+
+	float3 directionSum = float3(0.0f, 0.0f, 0.0f);
+	ghostao_unroll
+	for (uint j = 0u; j < uint(GHOSTAO_RAY_COUNT); j++)
+	{
+		if ((mask & (1u << j)) != 0u)
+		{
+			directionSum += ghostao_rayDirection(j);
+		}
+	}
+
+	float lengthSqrd = dot(directionSum, directionSum);
+	float3 bentNormal = lengthSqrd > 1e-8f ? directionSum * rsqrt(lengthSqrd) : float3(0.0f, 0.0f, 1.0f);
+	GhostAOBentNormalLutOut[int2(Tid.xy)] = float4(bentNormal, 0.0f);
+}

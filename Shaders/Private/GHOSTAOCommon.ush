@@ -1,0 +1,160 @@
+// Powered by rly_ghost
+// Based on the CORTAO reference implementation (MIT, Copyright (c) 2026 Daniel Isheden).
+#pragma once
+
+#define GHOSTAO_HLSL 1
+#define GHOSTAO_GLSL 0
+
+#ifndef GHOSTAO_PACKED_NORMAL_BITS
+#define GHOSTAO_PACKED_NORMAL_BITS 10
+#endif
+
+#ifndef GHOSTAO_RAY_COUNT
+#define GHOSTAO_RAY_COUNT 16
+#endif
+
+#ifndef GHOSTAO_SAMPLE_COUNT
+#define GHOSTAO_SAMPLE_COUNT 8
+#endif
+
+#define ghostao_bool bool
+#define ghostao_bool2 bool2
+#define ghostao_bool3 bool3
+#define ghostao_bool4 bool4
+
+#define ghostao_float float
+#define ghostao_float2 float2
+#define ghostao_float3 float3
+#define ghostao_float4 float4
+#define ghostao_float3x3 float3x3
+#define ghostao_float4x4 float4x4
+
+#define ghostao_int int
+#define ghostao_int2 int2
+#define ghostao_int3 int3
+#define ghostao_int4 int4
+
+#define ghostao_uint uint
+#define ghostao_uint2 uint2
+#define ghostao_uint3 uint3
+#define ghostao_uint4 uint4
+
+#define ghostao_half float
+#define ghostao_half2 float2
+#define ghostao_half3 float3
+#define ghostao_half4 float4
+#define ghostao_half3x3 float3x3
+#define ghostao_half4x4 float4x4
+
+#define ghostao_short int
+#define ghostao_short2 int2
+#define ghostao_short3 int3
+#define ghostao_short4 int4
+
+#define ghostao_ushort uint
+#define ghostao_ushort2 uint2
+#define ghostao_ushort3 uint3
+#define ghostao_ushort4 uint4
+
+#define ghostao_constant static const
+#define ghostao_unroll [unroll]
+
+#define ghostao_float_to_uint(f) asuint(f)
+#define ghostao_uint_to_float(i) asfloat(i)
+#define ghostao_fma(a, b, c) ((a) * (b) + (c))
+#define ghostao_mul(a, b) mul(b, a)
+#define ghostao_lerp(x, y, a) lerp(x, y, a)
+#define ghostao_inverseSqrt(x) rsqrt(x)
+#define ghostao_bitCount(x) countbits(x)
+#define ghostao_unpack16(x) uint2((x) & 0xFFFFu, (x) >> 16u)
+
+ghostao_constant ghostao_float GHOSTAO_PI = 3.14159265358979323846f;
+ghostao_constant ghostao_float GHOSTAO_PI2 = 6.28318530717958647692f;
+ghostao_constant ghostao_float GHOSTAO_GOLDEN_ANGLE = 2.39996322972865332223f;
+
+uint ghostao_seed(uint2 coords)
+{
+	uint2 q = coords * uint2(1719413u * 929u, 140473u * 2467u * 11u);
+	return q.x ^ q.y;
+}
+
+uint ghostao_hash(uint n)
+{
+	return n * (n ^ (n >> 15u));
+}
+
+uint2 ghostao_hash(uint2 n)
+{
+	return n * (n ^ (n >> 15u));
+}
+
+uint ghostao_encodeNormal(float3 normal, float2 dither)
+{
+	uint bitsPerComponent = uint(GHOSTAO_PACKED_NORMAL_BITS / 2);
+	uint componentMask = (1u << bitsPerComponent) - 1u;
+	uint componentMax = componentMask >> 1u;
+
+	float2 encodedNormal = normal.xy * rsqrt(mad(normal.z, 2.0f, 2.0f));
+	int2 values = int2(floor(mad(encodedNormal, float2(componentMax, componentMax), dither)));
+
+	return (uint(values.x) & componentMask) | ((uint(values.y) & componentMask) << bitsPerComponent);
+}
+
+float3 ghostao_decodeNormal(uint packedData)
+{
+	int bitsPerComponent = int(GHOSTAO_PACKED_NORMAL_BITS / 2);
+	uint componentMask = (1u << bitsPerComponent) - 1u;
+	uint componentMax = componentMask >> 1u;
+
+	int bits = 32;
+	int2 leftShift = int2(bits - bitsPerComponent, bits - bitsPerComponent * 2);
+	int2 rightShift = int2(bits - bitsPerComponent, bits - bitsPerComponent);
+	int2 values = int2(int(packedData) << leftShift.x, int(packedData) << leftShift.y) >> rightShift;
+
+	float2 e = float2(values) * (1.0f / float(componentMax));
+	float z = mad(-e.x, e.x, mad(-e.y, e.y, 1.0f));
+	return float3(e * (2.0f * sqrt(max(z, 0.0f))), mad(z, 2.0f, -1.0f));
+}
+
+float ghostao_unpackDepth(uint packedData)
+{
+	return asfloat(packedData);
+}
+
+float4 ghostao_unpackDepth(uint4 packedData)
+{
+	return asfloat(packedData);
+}
+
+uint2 ghostao_getResolution(uint packedResolution)
+{
+	return uint2(packedResolution & 0xFFFFu, packedResolution >> 16u);
+}
+
+float3 ghostao_rayDirection(uint rayIndex)
+{
+	float angle = float(rayIndex) * GHOSTAO_GOLDEN_ANGLE;
+	float radius = sqrt((float(rayIndex) + 0.5f) / float(GHOSTAO_RAY_COUNT));
+	float3 rayDirection = float3(cos(angle) * radius, sin(angle) * radius, sqrt(max(1.0f - radius * radius, 0.0f)));
+	return rayDirection;
+}
+
+float2 ghostao_encodeSphereMap(float3 direction)
+{
+	float2 encoded = direction.xy * rsqrt(mad(direction.z, 2.0f, 2.0f));
+	return mad(encoded, float2(0.5f, 0.5f), float2(0.5f, 0.5f));
+}
+
+float3 ghostao_decodeSphereMap(float2 coordinates)
+{
+	float2 encoded = coordinates * 2.0f - 1.0f;
+	float z = max(1.0f - dot(encoded, encoded), 0.0f);
+	float mul = 2.0f * sqrt(z);
+	return float3(encoded * mul, mad(z, 2.0f, -1.0f));
+}
+
+float3 ghostao_unproject(float4 unprojectParams, float2 texCoords, float linearDepth)
+{
+	float2 direction = mad(texCoords, unprojectParams.xy, unprojectParams.zw);
+	return mad(float3(direction, -1.0f), float3(linearDepth, linearDepth, linearDepth), 0.0f);
+}

@@ -1,0 +1,65 @@
+// Powered by rly_ghost
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/GHOSTAO/Private/GHOSTAOCommon.ush"
+
+Texture2D<float4> GhostAOSceneColor;
+Texture2D<float> GhostAOAO;
+Texture2D<uint> GhostAOPackedData;
+Texture2D<float4> GhostAOBentNormal;
+RWTexture2D<float4> GhostAOSceneColorOut;
+
+int2 GhostAOResolution;
+float4 GhostAOUnprojectParams;
+float GhostAOIntensity;
+float GhostAOSpecularOcclusion;
+uint GhostAOVisualizeBentNormals;
+
+[numthreads(8, 8, 1)]
+void MainCompositeCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	if (any(int2(ThreadId.xy) >= GhostAOResolution))
+	{
+		return;
+	}
+
+	int2 pixelCoords = int2(ThreadId.xy);
+	float2 texCoords = (float2(pixelCoords) + 0.5f) / float2(GhostAOResolution);
+
+	float4 sceneColor = GhostAOSceneColor.Load(int3(pixelCoords, 0));
+	float3 bentNormal = GhostAOBentNormal.Load(int3(pixelCoords, 0)).xyz;
+
+	if (GhostAOVisualizeBentNormals != 0u)
+	{
+		GhostAOSceneColorOut[pixelCoords] = float4(bentNormal * 0.5f + 0.5f, 1.0f);
+		return;
+	}
+
+	float3 color = sceneColor.rgb;
+
+	uint packedData = GhostAOPackedData.Load(int3(pixelCoords, 0));
+	float linearDepth = ghostao_unpackDepth(packedData);
+
+	if (linearDepth > 0.0f)
+	{
+		float ao = saturate(GhostAOAO.Load(int3(pixelCoords, 0)));
+
+		float aoApplied = lerp(1.0f, ao, saturate(GhostAOIntensity));
+
+		float specularOcclusion = 1.0f;
+		float bentLengthSqrd = dot(bentNormal, bentNormal);
+		if (bentLengthSqrd > 1e-4f)
+		{
+			float3 geometryNormal = ghostao_decodeNormal(packedData);
+			float3 viewPosition = ghostao_unproject(GhostAOUnprojectParams, texCoords, linearDepth);
+			float3 viewDirection = normalize(-viewPosition);
+			float3 reflectionDirection = reflect(-viewDirection, geometryNormal);
+			specularOcclusion = saturate(dot(bentNormal, reflectionDirection));
+			specularOcclusion *= specularOcclusion;
+		}
+
+		float specularApplied = lerp(1.0f, specularOcclusion, saturate(GhostAOSpecularOcclusion));
+		color *= aoApplied * specularApplied;
+	}
+
+	GhostAOSceneColorOut[pixelCoords] = float4(color, sceneColor.a);
+}

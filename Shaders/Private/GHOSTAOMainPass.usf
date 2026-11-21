@@ -1,0 +1,323 @@
+// Powered by rly_ghost
+// Based on the CORTAO reference implementation (MIT, Copyright (c) 2026 Daniel Isheden).
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/GHOSTAO/Private/GHOSTAOCommon.ush"
+
+#define GHOSTAO_PERSPECTIVE_PROJECTION 1
+#define GHOSTAO_ORTHOGRAPHIC_PROJECTION 0
+#define GHOSTAO_OCCLUDER_LOOKUP_TABLE 1
+#define GHOSTAO_BENT_NORMAL_LOOKUP_TABLE 1
+#define GHOSTAO_DEBUG_HOOKS 0
+
+uint GhostAOPackedResolution;
+uint GhostAORandomSeed;
+float GhostAONormalBias;
+float GhostAORadius;
+float4 GhostAOUnprojectParams;
+float4 GhostAOProjectionParams;
+float GhostAOMaxApparentCircleRadiusCoefficient;
+float GhostAOMipBias;
+float GhostAOInverseMaxSlopeCompensation;
+float GhostAOBackfaceThreshold;
+float GhostAOBackfaceBoost;
+
+Texture2D<uint> GhostAOPackedData;
+#if GHOSTAO_OCCLUDER_LOOKUP_TABLE
+Texture3D<uint> GhostAOOccluderLut;
+float4 GhostAOLutParams;
+#endif
+#if GHOSTAO_BENT_NORMAL_LOOKUP_TABLE
+Texture2D<float4> GhostAOBentNormalLut;
+#endif
+RWTexture2D<float> GhostAOOcclusion;
+#if GHOSTAO_BENT_NORMAL_LOOKUP_TABLE
+RWTexture2D<float4> GhostAOBentNormal;
+#endif
+
+struct GHOSTAOMainPassParameters
+{
+	uint packedResolution;
+	uint randomSeed;
+	float normalBias;
+	float radius;
+	float4 unprojectParams;
+	float4 projectionParams;
+	float maxApparentCircleRadiusCoefficient;
+	float mipBias;
+	float inverseMaxSlopeCompensation;
+	float backfaceThreshold;
+	float backfaceBoost;
+};
+
+GHOSTAOMainPassParameters ghostao_getParameters()
+{
+	GHOSTAOMainPassParameters p;
+	p.packedResolution = GhostAOPackedResolution;
+	p.randomSeed = GhostAORandomSeed;
+	p.normalBias = GhostAONormalBias;
+	p.radius = GhostAORadius;
+	p.unprojectParams = GhostAOUnprojectParams;
+	p.projectionParams = GhostAOProjectionParams;
+	p.maxApparentCircleRadiusCoefficient = GhostAOMaxApparentCircleRadiusCoefficient;
+	p.mipBias = GhostAOMipBias;
+	p.inverseMaxSlopeCompensation = GhostAOInverseMaxSlopeCompensation;
+	p.backfaceThreshold = GhostAOBackfaceThreshold;
+	p.backfaceBoost = GhostAOBackfaceBoost;
+	return p;
+}
+
+uint ghostao_samplePackedData(float2 texCoords, float mipmap)
+{
+	uint2 res = ghostao_getResolution(GhostAOPackedResolution);
+	int2 px = int2(floor(texCoords * float2(res)));
+	if (any(px < 0) || any(px >= int2(res)))
+	{
+		return 0u;
+	}
+	return GhostAOPackedData.Load(int3(px, 0));
+}
+
+float3 ghostao_loadNormal(int2 pixelCoords)
+{
+	uint2 res = ghostao_getResolution(GhostAOPackedResolution);
+	float2 texCoords = (float2(pixelCoords) + 0.5f) / float2(res);
+	return ghostao_decodeNormal(ghostao_samplePackedData(texCoords, 0.0f));
+}
+
+float3 ghostao_unprojectWithOffset(float4 unprojectParameters, float2 texCoords, float linearDepth, float3 offset)
+{
+	float2 direction = mad(texCoords, unprojectParameters.xy, unprojectParameters.zw);
+	return mad(float3(direction, -1.0f), float3(linearDepth, linearDepth, linearDepth), offset);
+}
+
+uint ghostao_computeRayOcclusion(
+	float offsetDither,
+	float3x3 offsetTransform,
+	float3x3 tangentSpaceTransform,
+	float mipBias,
+	float3 viewPosition,
+	float3 normal,
+	float3 viewDirection,
+	float maxRadius,
+	GHOSTAOMainPassParameters params)
+{
+	uint rayBits = 0u;
+
+	ghostao_unroll
+	for (uint i = 0u; i < GHOSTAO_SAMPLE_COUNT; i++)
+	{
+		float a = float(i) * GHOSTAO_GOLDEN_ANGLE;
+		float2 spiral = float2(cos(a), sin(a));
+
+		float inverseSampleCount = 1.0f / float(GHOSTAO_SAMPLE_COUNT);
+		float skew = 3.5f;
+
+		float innerRadius = pow((float(i) + 0.0f) * inverseSampleCount, skew * 0.5f);
+		float outerRadius = pow((float(i) + 1.0f) * inverseSampleCount, skew * 0.5f);
+
+		float2 innerSpiral = spiral * innerRadius;
+		float2 outerSpiral = spiral * outerRadius;
+
+		float sampleArea = outerRadius * outerRadius - innerRadius * innerRadius;
+		float sampleWeight = sqrt(sampleArea);
+		float sampleMipmap = log2(outerRadius);
+
+		float2 sampleOffset = mad(outerSpiral - innerSpiral, float2(offsetDither, offsetDither), innerSpiral);
+
+		float3 projectedCoords = ghostao_mul(offsetTransform, float3(sampleOffset, 1.0f));
+		float2 sampleCoords = projectedCoords.xy;
+#if GHOSTAO_PERSPECTIVE_PROJECTION
+		sampleCoords /= projectedCoords.z;
+#endif
+
+		float mipmap = mipBias + sampleMipmap;
+		uint packedData = ghostao_samplePackedData(sampleCoords, mipmap);
+		float sampleDepth = ghostao_unpackDepth(packedData);
+
+		float3 dPos = ghostao_unprojectWithOffset(params.unprojectParams, sampleCoords, sampleDepth, -viewPosition);
+
+		float lengthSqrd = dot(dPos, dPos);
+		if (lengthSqrd < maxRadius * maxRadius && dot(dPos, normal) > 0.0f)
+		{
+			float inverseLength = rsqrt(lengthSqrd);
+			float3 direction = dPos * inverseLength;
+
+			float3 sampleNormal = ghostao_decodeNormal(packedData);
+
+			float slopeCompensation = rsqrt(max(dot(sampleNormal, viewDirection), params.inverseMaxSlopeCompensation));
+			float occluderRadius = (maxRadius * sampleWeight) * (slopeCompensation * inverseLength);
+
+			float sampleDot = dot(sampleNormal, direction);
+			if (sampleDot < params.backfaceThreshold)
+			{
+				float adjustedOffset = (-occluderRadius) / max(1.0f - occluderRadius * occluderRadius * 0.5f, 0.000001f);
+				direction = normalize(mad(sampleNormal, float3(adjustedOffset, adjustedOffset, adjustedOffset), direction));
+			}
+			else
+			{
+				occluderRadius *= lerp(1.0f, slopeCompensation, params.backfaceBoost);
+			}
+
+			float3 hemisphereDirection = ghostao_mul(direction, tangentSpaceTransform);
+
+			uint occluderRayBits = 0u;
+#if GHOSTAO_OCCLUDER_LOOKUP_TABLE
+			float mul = rsqrt(mad(hemisphereDirection.z, 8.0f, 8.0f));
+			float2 sphereMapCoordinates = mad(hemisphereDirection.xy, float2(mul, mul), float2(0.5f, 0.5f));
+			float3 lookupCoords = float3(sphereMapCoordinates, occluderRadius * sqrt(0.5f));
+
+			float3 lutResolution = GhostAOLutParams.xyz;
+			int3 lutCoords = int3(floor(lookupCoords * lutResolution));
+			lutCoords = clamp(lutCoords, int3(0, 0, 0), int3(lutResolution) - 1);
+			occluderRayBits = GhostAOOccluderLut.Load(int4(lutCoords, 0));
+			if (hemisphereDirection.z <= -0.99f)
+			{
+				occluderRayBits = 0u;
+			}
+#else
+			float occluderCosAngle = max(0.0f, 1.0f - occluderRadius * occluderRadius * 0.5f);
+			ghostao_unroll
+			for (uint j = 0u; j < GHOSTAO_RAY_COUNT; j++)
+			{
+				float3 rayDirection = ghostao_rayDirection(j);
+				if (dot(rayDirection, hemisphereDirection) > occluderCosAngle)
+				{
+					occluderRayBits |= 1u << j;
+				}
+			}
+#endif
+			rayBits |= occluderRayBits;
+		}
+	}
+
+	return rayBits;
+}
+
+void ghostao_constructSamplingBasis(float3 normal, out float3 tangent, out float3 bitangent)
+{
+	float a = 1.0f / (1.0f + normal.z);
+	float b = normal.x * normal.y * a;
+	tangent = float3(mad(normal.x * normal.x, a, -1.0f), b, normal.x);
+	bitangent = float3(b, mad(normal.y * normal.y, a, -1.0f), normal.y);
+}
+
+void ghostao_constructTangentBasis(float3 normal, out float3 tangent, out float3 bitangent)
+{
+	float a = 1.0f / (1.0f + normal.z);
+	float b = normal.x * normal.y * a;
+	tangent = float3(mad(normal.x * normal.x, a, -1.0f), b, normal.x);
+	bitangent = float3(b, mad(normal.y * normal.y, a, -1.0f), normal.y);
+}
+
+float ghostao_resolveOcclusion(uint rayBits)
+{
+	uint numBits = ghostao_bitCount(rayBits);
+	return mad(float(numBits), -1.0f / float(GHOSTAO_RAY_COUNT), 1.0f);
+}
+
+[numthreads(16, 16, 1)]
+void MainMainPassCS(uint3 Tid : SV_DispatchThreadID)
+{
+	GHOSTAOMainPassParameters params = ghostao_getParameters();
+
+	uint2 resolution = ghostao_getResolution(params.packedResolution);
+	uint2 pixelCoords = Tid.xy;
+	if (any(pixelCoords >= resolution))
+	{
+		return;
+	}
+
+	float2 texCoords = (float2(pixelCoords) + 0.5f) / float2(resolution);
+
+	uint centerPackedData = 0u;
+	float linearDepth = 0.0f;
+#if GHOSTAO_PERSPECTIVE_PROJECTION
+	if (any(pixelCoords < resolution))
+	{
+		centerPackedData = GhostAOPackedData.Load(int3(int2(pixelCoords), 0));
+		linearDepth = ghostao_unpackDepth(centerPackedData);
+	}
+#endif
+	if (linearDepth == 0.0f)
+	{
+		GhostAOOcclusion[pixelCoords] = 1.0f;
+#if GHOSTAO_BENT_NORMAL_LOOKUP_TABLE
+		GhostAOBentNormal[pixelCoords] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+#endif
+		return;
+	}
+
+	float3 normal = ghostao_decodeNormal(GhostAOPackedData.Load(int3(int2(pixelCoords), 0)));
+	float3 viewPosition = ghostao_unproject(params.unprojectParams, texCoords, linearDepth);
+
+	uint2 random = ghostao_hash(ghostao_seed(pixelCoords) + ghostao_unpack16(params.randomSeed));
+
+	float randomSampleRotation = float(random.x) * (GHOSTAO_PI2 / float(0xFFFFFFFFu));
+	float offsetDither = float(random.y) * (1.0f / float(0xFFFFFFFFu));
+	float randomTangentRotation = float(random.x ^ random.y ^ params.randomSeed) * (GHOSTAO_PI2 / float(0xFFFFFFFFu));
+	float2 sampleRotation = float2(sin(randomSampleRotation), cos(randomSampleRotation));
+
+	float clampedRadius = min(params.radius, linearDepth * params.maxApparentCircleRadiusCoefficient);
+
+	float inverseCircleDistance = rsqrt(max(linearDepth * linearDepth - clampedRadius * clampedRadius, 1e-8f));
+	float apparentCircleRadius = clampedRadius * inverseCircleDistance;
+	float circleRadius = apparentCircleRadius * linearDepth;
+
+	float3 viewDirection = -normalize(viewPosition);
+
+	float stretchMultiplier = rsqrt(max(viewDirection.z, 1e-4f));
+	float baseMipBias = log2(max(apparentCircleRadius * stretchMultiplier, 1e-6f)) + params.mipBias;
+
+	float pixelSize = params.normalBias * linearDepth;
+	viewPosition = mad(normal, float3(pixelSize, pixelSize, pixelSize), viewPosition);
+
+	float2 scaledRotation = sampleRotation * circleRadius;
+	float3x3 rotationScaleMatrix = float3x3(
+		scaledRotation.x, -scaledRotation.y, 0.0f,
+		scaledRotation.y, scaledRotation.x, 0.0f,
+		0.0f, 0.0f, 1.0f);
+
+	float3 right;
+	float3 up;
+	ghostao_constructSamplingBasis(viewDirection, right, up);
+
+	if ((random.x & 1u) == 0u)
+	{
+		right = -right;
+	}
+
+	float3x3 circleMatrix = float3x3(
+		right,
+		up,
+		viewPosition);
+
+	float3x3 projectionMatrix = float3x3(
+		params.projectionParams.x, 0.0f, 0.0f,
+		0.0f, params.projectionParams.y, 0.0f,
+		params.projectionParams.zw, -1.0f);
+
+	float3x3 offsetTransform = ghostao_mul(ghostao_mul(projectionMatrix, circleMatrix), rotationScaleMatrix);
+
+	float3 t;
+	float3 bt;
+	ghostao_constructTangentBasis(normal, t, bt);
+
+	float s = sin(randomTangentRotation);
+	float c = cos(randomTangentRotation);
+	float3 tangent = c * t + s * bt;
+	float3 bitangent = c * bt - s * t;
+	float3x3 tangentSpaceTransform = float3x3(tangent, bitangent, normal);
+
+	uint rayBits = ghostao_computeRayOcclusion(offsetDither, offsetTransform, tangentSpaceTransform, baseMipBias,
+		viewPosition, normal, viewDirection, clampedRadius, params);
+
+	GhostAOOcclusion[pixelCoords] = ghostao_resolveOcclusion(rayBits);
+
+#if GHOSTAO_BENT_NORMAL_LOOKUP_TABLE
+	uint bentNormalMask = rayBits & ((1u << GHOSTAO_RAY_COUNT) - 1u);
+	int2 bentNormalCoords = int2(int(bentNormalMask) & 255, int(bentNormalMask) >> 8);
+	float3 bentNormalTangent = GhostAOBentNormalLut.Load(int3(bentNormalCoords, 0)).xyz;
+	float3 bentNormalView = ghostao_mul(bentNormalTangent, tangentSpaceTransform);
+	GhostAOBentNormal[pixelCoords] = float4(bentNormalView, 1.0f);
+#endif
+}

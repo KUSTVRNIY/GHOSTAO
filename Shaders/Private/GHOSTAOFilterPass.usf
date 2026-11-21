@@ -1,0 +1,195 @@
+// Powered by rly_ghost
+// Based on the CORTAO reference implementation (MIT, Copyright (c) 2026 Daniel Isheden).
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/GHOSTAO/Private/GHOSTAOCommon.ush"
+
+#define GHOSTAO_LARGE_FILTER 0
+#define GHOSTAO_FILTER_SYMMETRY 0
+
+int2 GhostAOPackedResolution;
+float GhostAODepthSensitivity;
+float GhostAONormalSensitivity;
+
+Texture2D<uint> GhostAOPackedData;
+Texture2D<float> GhostAOOcclusionIn;
+RWTexture2D<float> GhostAOOcclusionOut;
+
+uint ghostao_loadPacked(int2 px)
+{
+	uint2 res = uint2(GhostAOPackedResolution);
+	if (any(px < 0) || any(px >= int2(res)))
+	{
+		return 0u;
+	}
+	return GhostAOPackedData.Load(int3(px, 0));
+}
+
+float ghostao_loadOcclusion(int2 px)
+{
+	uint2 res = uint2(GhostAOPackedResolution);
+	if (any(px < 0) || any(px >= int2(res)))
+	{
+		return 1.0f;
+	}
+	return GhostAOOcclusionIn.Load(int3(px, 0)).x;
+}
+
+uint4 ghostao_gatherPackedData(float2 texCoords, int2 offset)
+{
+	int2 pixel = int2(floor(texCoords * float2(GhostAOPackedResolution)));
+	int2 base = pixel + offset + int2(-1, -1);
+	uint4 r;
+	r.x = ghostao_loadPacked(base + int2(0, 0));
+	r.y = ghostao_loadPacked(base + int2(1, 0));
+	r.z = ghostao_loadPacked(base + int2(1, 1));
+	r.w = ghostao_loadPacked(base + int2(0, 1));
+	return r;
+}
+
+float4 ghostao_gatherOcclusion(float2 texCoords, int2 offset)
+{
+	int2 pixel = int2(floor(texCoords * float2(GhostAOPackedResolution)));
+	int2 base = pixel + offset + int2(-1, -1);
+	float4 r;
+	r.x = ghostao_loadOcclusion(base + int2(0, 0));
+	r.y = ghostao_loadOcclusion(base + int2(1, 0));
+	r.z = ghostao_loadOcclusion(base + int2(1, 1));
+	r.w = ghostao_loadOcclusion(base + int2(0, 1));
+	return r;
+}
+
+int4 ghostao_unpackNormalX(uint4 packedData)
+{
+	uint normalBits = uint(GHOSTAO_PACKED_NORMAL_BITS / 2);
+	return (int4(packedData) << (32 - normalBits)) >> (32 - normalBits);
+}
+
+int4 ghostao_unpackNormalY(uint4 packedData)
+{
+	uint normalBits = uint(GHOSTAO_PACKED_NORMAL_BITS / 2);
+	return (int4(packedData) << (32 - normalBits * 2)) >> (32 - normalBits);
+}
+
+struct GHOSTAOWeightParams
+{
+	float4 depthMul;
+	float depthOffset;
+	float4 deltaX;
+	float4 deltaY;
+	int4 centerNormalX;
+	int4 centerNormalY;
+	float normalErrorMul;
+};
+
+float4 ghostao_calculateWeight(GHOSTAOWeightParams params, uint4 packedData, int2 offset)
+{
+	float4 sampleDepth = float4(mad(ghostao_unpackDepth(packedData), params.depthMul, params.depthOffset.xxxx));
+	float4 error = abs(mad(params.deltaX, float4(offset.xxxx), mad(params.deltaY, float4(offset.yyyy), sampleDepth)));
+
+	int4 normalX = ghostao_unpackNormalX(packedData) - params.centerNormalX;
+	int4 normalY = ghostao_unpackNormalY(packedData) - params.centerNormalY;
+	float4 normalError = float4(normalX * normalX + normalY * normalY);
+	error = mad(normalError, params.normalErrorMul.xxxx, error);
+
+	return exp2(-error);
+}
+
+float4 ghostao_filterAccumulate(float4 ssaoSum, float2 texCoords, int2 offset, float4 weight)
+{
+	return mad(ghostao_gatherOcclusion(texCoords, offset), weight, ssaoSum);
+}
+
+[numthreads(8, 8, 1)]
+void MainFilterPassCS(uint3 threadCoords : SV_DispatchThreadID)
+{
+	int2 resolution = GhostAOPackedResolution;
+
+	int2 pixelCoords = int2(threadCoords.xy << uint2(1u, 1u)) | int2(1, 1);
+
+	if (pixelCoords.x > resolution.x || pixelCoords.y > resolution.y)
+	{
+		return;
+	}
+
+	float2 texCoords = float2(pixelCoords) / float2(resolution);
+
+	uint4 centerPackedData = ghostao_gatherPackedData(texCoords, int2(0, 0));
+
+	int2 coords[4] = { pixelCoords + int2(-1, -1), pixelCoords + int2(0, -1), pixelCoords + int2(0, 0), pixelCoords + int2(-1, 0) };
+
+	if (centerPackedData.x == 0u && centerPackedData.y == 0u && centerPackedData.z == 0u && centerPackedData.w == 0u)
+	{
+		ghostao_unroll
+		for (uint k = 0u; k < 4u; k++)
+		{
+			int2 outputCoords = coords[k];
+			if (outputCoords.x >= 0 && outputCoords.y >= 0 &&
+				outputCoords.x < resolution.x && outputCoords.y < resolution.y)
+			{
+				GhostAOOcclusionOut[outputCoords] = 1.0f;
+			}
+		}
+		return;
+	}
+
+	float4 centerDepth = float4(ghostao_unpackDepth(centerPackedData));
+	float4 inverseCenterDepth = 1.0f / max(centerDepth, 1e-8f);
+
+	float4 deltaX = (centerDepth.xxww - centerDepth.yyzz) * inverseCenterDepth;
+	float4 deltaY = (centerDepth.wzzw - centerDepth.xyyx) * inverseCenterDepth;
+
+	GHOSTAOWeightParams weightParams;
+	weightParams.depthMul = GhostAODepthSensitivity * inverseCenterDepth;
+	weightParams.depthOffset = -GhostAODepthSensitivity;
+	weightParams.deltaX = deltaX * GhostAODepthSensitivity;
+	weightParams.deltaY = deltaY * GhostAODepthSensitivity;
+	weightParams.centerNormalX = ghostao_unpackNormalX(centerPackedData);
+	weightParams.centerNormalY = ghostao_unpackNormalY(centerPackedData);
+	weightParams.normalErrorMul = GhostAONormalSensitivity * (1.0f / float(1u << (GHOSTAO_PACKED_NORMAL_BITS / 2)));
+
+	float4 ssaoSum = 0.0f;
+	ssaoSum = ghostao_filterAccumulate(ssaoSum, texCoords, int2(0, 0), 1.0f);
+	float4 weightSum = 1.0f;
+
+#if GHOSTAO_LARGE_FILTER
+	const uint sampleCount = 6u;
+	const int2 offsets[6] = { int2(3, 0), int2(6, 0), int2(3, 3), int2(0, 3), int2(0, 6), int2(3, -3) };
+#else
+	const uint sampleCount = 2u;
+	const int2 offsets[2] = { int2(3, 0), int2(0, 3) };
+#endif
+
+	ghostao_unroll
+	for (uint i = 0u; i < sampleCount; i++)
+	{
+		int2 offset = offsets[i];
+
+		float4 weightA = ghostao_calculateWeight(weightParams, ghostao_gatherPackedData(texCoords, -offset), -offset);
+		float4 weightB = ghostao_calculateWeight(weightParams, ghostao_gatherPackedData(texCoords, offset), offset);
+
+#if GHOSTAO_FILTER_SYMMETRY
+		float4 minWeight = min(weightA, weightB);
+		weightA = minWeight;
+		weightB = minWeight;
+		weightSum = mad(minWeight, 2.0f, weightSum);
+#else
+		weightSum += weightA + weightB;
+#endif
+
+		ssaoSum = ghostao_filterAccumulate(ssaoSum, texCoords, -offset, weightA);
+		ssaoSum = ghostao_filterAccumulate(ssaoSum, texCoords, offset, weightB);
+	}
+
+	ssaoSum *= 1.0f / weightSum;
+
+	ghostao_unroll
+	for (uint k = 0u; k < 4u; k++)
+	{
+		int2 outputCoords = coords[k];
+		if (outputCoords.x >= 0 && outputCoords.y >= 0 &&
+			outputCoords.x < resolution.x && outputCoords.y < resolution.y)
+		{
+			GhostAOOcclusionOut[outputCoords] = (centerPackedData[k] != 0u) ? ssaoSum[k] : 1.0f;
+		}
+	}
+}
