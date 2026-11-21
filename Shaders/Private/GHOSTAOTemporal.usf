@@ -3,6 +3,7 @@
 #include "/Plugin/GHOSTAO/Private/GHOSTAOCommon.ush"
 
 int2 GhostAOResolution;
+int2 GhostAOHistoryResolution;
 float4x4 GhostAOPrevViewProj;
 Texture2D<uint> GhostAOPackedData;
 float4 GhostAOUnprojectParams;
@@ -16,9 +17,9 @@ Texture2D<float4> GhostAOBentNormalHistory;
 RWTexture2D<float> GhostAOAOOut;
 RWTexture2D<float4> GhostAOBentNormalOut;
 
-float ghostao_loadAOBilinear(Texture2D<float> texture, float2 uv)
+float ghostao_loadAOBilinear(Texture2D<float> texture, float2 uv, int2 historyResolution)
 {
-	int2 res = GhostAOResolution;
+	int2 res = historyResolution;
 	float2 position = saturate(uv) * float2(res) - 0.5f;
 	float2 base = floor(position);
 	float2 fraction = position - base;
@@ -89,7 +90,7 @@ void MainTemporalCS(uint3 ThreadId : SV_DispatchThreadID)
 		}
 
 		float2 historyUV = historyValid ? prevUV : uv;
-		float historyAO = ghostao_loadAOBilinear(GhostAOAOHistory, historyUV);
+		float historyAO = ghostao_loadAOBilinear(GhostAOAOHistory, historyUV, GhostAOHistoryResolution);
 		historyAO = clamp(historyAO, localMin, localMax);
 		result = lerp(historyAO, currentAO, saturate(GhostAOTemporalBlend));
 	}
@@ -99,7 +100,7 @@ void MainTemporalCS(uint3 ThreadId : SV_DispatchThreadID)
 	if (GhostAOTemporalBlend < 1.0f && dot(currentBentNormal.xyz, currentBentNormal.xyz) > 1e-8f)
 	{
 		float2 historyUV = historyValid ? prevUV : uv;
-		int2 prevPixel = clamp(int2(floor(historyUV * float2(resolution))), int2(0, 0), resolution - 1);
+		int2 prevPixel = clamp(int2(floor(historyUV * float2(GhostAOHistoryResolution))), int2(0, 0), GhostAOHistoryResolution - 1);
 		float3 historyBentNormal = GhostAOBentNormalHistory.Load(int3(prevPixel, 0)).xyz;
 		float3 blended = lerp(historyBentNormal, currentBentNormal.xyz, saturate(GhostAOTemporalBlend));
 		float blendedLengthSqrd = dot(blended, blended);

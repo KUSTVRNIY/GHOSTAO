@@ -125,6 +125,7 @@ public:
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, GhostAOAOOut)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, GhostAOBentNormalOut)
 		SHADER_PARAMETER(FIntPoint, GhostAOResolution)
+		SHADER_PARAMETER(FIntPoint, GhostAOHistoryResolution)
 		SHADER_PARAMETER(FMatrix44f, GhostAOPrevViewProj)
 		SHADER_PARAMETER(FMatrix44f, GhostAOViewToWorld)
 		SHADER_PARAMETER(FVector4f, GhostAOUnprojectParams)
@@ -340,6 +341,7 @@ namespace GHOSTAO
 			TexCreate_ShaderResource | TexCreate_UAV, 1);
 		FRDGTextureRef AORawTexture = GraphBuilder.CreateTexture(AODesc, TEXT("GHOSTAO.OcclusionRaw"));
 		FRDGTextureRef AOFilteredTexture = GraphBuilder.CreateTexture(AODesc, TEXT("GHOSTAO.OcclusionFiltered"));
+		FRDGTextureRef AOFiltered2Texture = GraphBuilder.CreateTexture(AODesc, TEXT("GHOSTAO.OcclusionFiltered2"));
 
 		TRDGUniformBufferRef<FSceneTextureUniformParameters> SceneTextureUniformBuffer =
 			CreateSceneTextureUniformBuffer(GraphBuilder, View, ESceneTextureSetupMode::SceneDepth);
@@ -483,6 +485,25 @@ namespace GHOSTAO
 				FComputeShaderUtils::GetGroupCount(FIntPoint(FMath::DivideAndRoundUp(Extent.X, 16), FMath::DivideAndRoundUp(Extent.Y, 16)), 1));
 		}
 
+		{
+			TShaderMapRef<FGHOSTAOFilterPassCS> Shader(GetGlobalShaderMap(View.GetFeatureLevel()));
+			FGHOSTAOFilterPassCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FGHOSTAOFilterPassCS::FParameters>();
+			PassParameters->GhostAOPackedData = GraphBuilder.CreateSRV(PackedTexture);
+			PassParameters->GhostAOOcclusionIn = GraphBuilder.CreateSRV(AOFilteredTexture);
+			PassParameters->GhostAOOcclusionOut = GraphBuilder.CreateUAV(AOFiltered2Texture);
+			PassParameters->GhostAOPackedResolution = PackedResolution;
+			PassParameters->GhostAODepthSensitivity = 512.0f;
+			PassParameters->GhostAONormalSensitivity = 128.0f;
+
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
+				RDG_EVENT_NAME("GHOSTAO FilterPass2"),
+				ERDGPassFlags::Compute,
+				Shader,
+				PassParameters,
+				FComputeShaderUtils::GetGroupCount(FIntPoint(FMath::DivideAndRoundUp(Extent.X, 16), FMath::DivideAndRoundUp(Extent.Y, 16)), 1));
+		}
+
 		FRDGTextureDesc AOAccumDesc = FRDGTextureDesc::Create2D(
 			Extent, PF_R32_FLOAT, FClearValueBinding::None,
 			TexCreate_ShaderResource | TexCreate_UAV, 1);
@@ -497,13 +518,11 @@ namespace GHOSTAO
 		uint64 ViewKeyBits = (View.Family != nullptr && View.Family->Scene != nullptr)
 			? (uint64)(UPTRINT)View.Family->Scene
 			: 0ull;
-		ViewKeyBits ^= ((uint64)(uint32)Extent.X << 32) | (uint64)(uint32)Extent.Y;
 		const void* ViewKey = (const void*)ViewKeyBits;
 		FHistoryEntry* HistoryEntry = ViewKey != nullptr ? GGHOSTAOHistory.Find(ViewKey) : nullptr;
 		const bool bHistoryValid = HistoryEntry != nullptr
 			&& HistoryEntry->bHasHistory
-			&& HistoryEntry->Texture.IsValid()
-			&& HistoryEntry->Size == Extent;
+			&& HistoryEntry->Texture.IsValid();
 
 		FRDGTextureRef HistoryTexture = bHistoryValid
 			? GraphBuilder.RegisterExternalTexture(HistoryEntry->Texture, TEXT("GHOSTAO.HistoryAO"))
@@ -535,13 +554,16 @@ namespace GHOSTAO
 			TShaderMapRef<FGHOSTAOTemporalCS> Shader(GetGlobalShaderMap(View.GetFeatureLevel()));
 			FGHOSTAOTemporalCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FGHOSTAOTemporalCS::FParameters>();
 			PassParameters->GhostAOPackedData = GraphBuilder.CreateSRV(PackedTexture);
-			PassParameters->GhostAOAOIn = GraphBuilder.CreateSRV(AOFilteredTexture);
+			PassParameters->GhostAOAOIn = GraphBuilder.CreateSRV(AOFiltered2Texture);
 			PassParameters->GhostAOAOHistory = GraphBuilder.CreateSRV(HistoryTexture);
 			PassParameters->GhostAOBentNormalIn = GraphBuilder.CreateSRV(BentNormalTexture);
 			PassParameters->GhostAOBentNormalHistory = GraphBuilder.CreateSRV(BentNormalHistoryTexture);
 			PassParameters->GhostAOAOOut = GraphBuilder.CreateUAV(AOAccumTexture);
 			PassParameters->GhostAOBentNormalOut = GraphBuilder.CreateUAV(BentNormalAccumTexture);
 			PassParameters->GhostAOResolution = Extent;
+			PassParameters->GhostAOHistoryResolution = (bHistoryValid && HistoryEntry != nullptr)
+				? HistoryEntry->Size
+				: Extent;
 			PassParameters->GhostAOPrevViewProj = PrevViewProj;
 			PassParameters->GhostAOViewToWorld = ToMatrix44f(View.ViewMatrices.GetInvViewMatrix());
 			PassParameters->GhostAOUnprojectParams = FVector4f(2.0f * TanHalfFovX, -2.0f * TanHalfFovY, -TanHalfFovX, TanHalfFovY);
@@ -558,7 +580,7 @@ namespace GHOSTAO
 
 		if (ViewKey != nullptr)
 		{
-			if (GGHOSTAOHistory.Num() > 16)
+			if (GGHOSTAOHistory.Num() > 256)
 			{
 				GGHOSTAOHistory.Empty();
 			}

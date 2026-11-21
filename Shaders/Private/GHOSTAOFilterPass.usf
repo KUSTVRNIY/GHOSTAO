@@ -3,7 +3,7 @@
 #include "/Engine/Private/Common.ush"
 #include "/Plugin/GHOSTAO/Private/GHOSTAOCommon.ush"
 
-#define GHOSTAO_LARGE_FILTER 0
+#define GHOSTAO_LARGE_FILTER 1
 #define GHOSTAO_FILTER_SYMMETRY 0
 
 int2 GhostAOPackedResolution;

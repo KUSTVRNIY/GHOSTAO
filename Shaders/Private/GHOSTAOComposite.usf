@@ -41,7 +41,22 @@ void MainCompositeCS(uint3 ThreadId : SV_DispatchThreadID)
 
 	if (linearDepth > 0.0f)
 	{
-		float ao = saturate(GhostAOAO.Load(int3(pixelCoords, 0)));
+		float aoSum = 0.0f;
+		float aoWeightSum = 0.0f;
+		[unroll]
+		for (int dy = -1; dy <= 1; ++dy)
+		{
+			[unroll]
+			for (int dx = -1; dx <= 1; ++dx)
+			{
+				int2 coord = clamp(pixelCoords + int2(dx, dy), int2(0, 0), GhostAOResolution - 1);
+				float weight = (dx == 0 && dy == 0) ? 4.0f : ((abs(dx) + abs(dy) == 1) ? 2.0f : 1.0f);
+				aoSum += GhostAOAO.Load(int3(coord, 0)) * weight;
+				aoWeightSum += weight;
+			}
+		}
+
+		float ao = saturate(aoSum / aoWeightSum);
 
 		float aoApplied = lerp(1.0f, ao, saturate(GhostAOIntensity));
 
